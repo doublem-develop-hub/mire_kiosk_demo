@@ -8,6 +8,8 @@ import type { KioskUser } from '@/screens/ScannedScreen'
 import { StressScreen } from '@/screens/StressScreen'
 import { MeasuringScreen } from '@/screens/MeasuringScreen'
 import type { MeasuringStage, VitalsResult } from '@/screens/MeasuringScreen'
+import { VitalsScanningOverlay } from '@/screens/VitalsScanningOverlay'
+import type { VitalsScanPhase } from '@/screens/VitalsScanningOverlay'
 import { AnalyzingScreen } from '@/screens/AnalyzingScreen'
 import { DoneScreen } from '@/screens/DoneScreen'
 import type { MeasureSummary } from '@/screens/DoneScreen'
@@ -308,15 +310,77 @@ function ErrorPreview({ errorKey }: { errorKey: string }) {
   )
 }
 
+/**
+ * 생체 신호 스캐닝 화면만 따로 확인하는 미리보기 - 실제 서버/하드웨어 없이
+ * 버튼으로 waiting/measuring/done을 직접 넘겨볼 수 있다. 예: /?preview=vitals
+ */
+function VitalsPreview() {
+  const TOTAL = 12
+  const [phase, setPhase] = useState<VitalsScanPhase>('waiting')
+  const [remaining, setRemaining] = useState(TOTAL)
+
+  useEffect(() => {
+    if (phase !== 'measuring') return
+    setRemaining(TOTAL)
+    const id = setInterval(() => {
+      setRemaining((r) => Math.max(0, r - 1))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [phase])
+
+  const fakeResult: VitalsResult = { temp_c: 36.6, heart_rate_bpm: 74, spo2_pct: 98 }
+
+  return (
+    <KioskFrame>
+      <div className="flex h-full flex-col">
+        <div className="min-h-0 flex-1">
+          <VitalsScanningOverlay
+            phase={phase}
+            remainingSeconds={remaining}
+            totalSeconds={TOTAL}
+            result={phase === 'done' ? fakeResult : null}
+            username="테스트"
+          />
+        </div>
+        <div className="flex flex-wrap justify-center gap-4 pb-10">
+          <button
+            onClick={() => setPhase('waiting')}
+            className="rounded-full border-2 border-primary px-8 py-4 text-2xl font-bold text-primary"
+          >
+            대기 (손 떼기)
+          </button>
+          <button
+            onClick={() => setPhase('measuring')}
+            className="rounded-full bg-primary px-8 py-4 text-2xl font-bold text-primary-foreground"
+          >
+            측정 시작 (손 올리기)
+          </button>
+          <button
+            onClick={() => setPhase('done')}
+            className="rounded-full border-2 border-primary px-8 py-4 text-2xl font-bold text-primary"
+          >
+            완료 (실제값 표시)
+          </button>
+        </div>
+      </div>
+    </KioskFrame>
+  )
+}
+
 export default function App() {
-  const errorKey =
-    typeof window !== 'undefined'
-      ? new URLSearchParams(window.location.search).get('error')
-      : null
+  const params = typeof window !== 'undefined' ? new URLSearchParams(window.location.search) : null
+  const errorKey = params?.get('error') ?? null
+  const preview = params?.get('preview') ?? null
 
   return (
     <QueryClientProvider client={queryClient}>
-      {errorKey ? <ErrorPreview errorKey={errorKey} /> : <Kiosk />}
+      {preview === 'vitals' ? (
+        <VitalsPreview />
+      ) : errorKey ? (
+        <ErrorPreview errorKey={errorKey} />
+      ) : (
+        <Kiosk />
+      )}
     </QueryClientProvider>
   )
 }
