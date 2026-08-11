@@ -1,0 +1,322 @@
+import { useCallback, useEffect, useRef, useState } from 'react'
+import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
+import { KioskFrame } from '@/components/KioskFrame'
+import { IdleScreen } from '@/screens/IdleScreen'
+import { UserSelectScreen } from '@/screens/UserSelectScreen'
+import { ScannedScreen } from '@/screens/ScannedScreen'
+import type { KioskUser } from '@/screens/ScannedScreen'
+import { StressScreen } from '@/screens/StressScreen'
+import { MeasuringScreen } from '@/screens/MeasuringScreen'
+import type { MeasuringStage, VitalsResult } from '@/screens/MeasuringScreen'
+import { AnalyzingScreen } from '@/screens/AnalyzingScreen'
+import { DoneScreen } from '@/screens/DoneScreen'
+import type { MeasureSummary } from '@/screens/DoneScreen'
+import { ErrorScreen } from '@/screens/ErrorScreen'
+import { ERRORS } from '@/kiosk/errors'
+import type { ErrorDef } from '@/kiosk/errors'
+import {
+  fetchRoster,
+  startVisit,
+  retryVisit,
+  cancelVisit,
+  openVisitSocket,
+} from '@/lib/api'
+import type { StressLevel, VisitEvent } from '@/lib/api'
+
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: { staleTime: 60 * 1000, refetchOnWindowFocus: false },
+  },
+})
+
+type Phase =
+  | 'idle'
+  | 'select'
+  | 'scanned'
+  | 'stress'
+  | 'measuring'
+  | 'analyzing'
+  | 'done'
+  | 'error'
+
+/** 본인 확인 완료 화면 표시 시간(ms) */
+const SCANNED_DELAY = 1800
+/** AI 분석 연출 시간(ms) */
+const ANALYZE_DELAY = 2800
+/** 완료 화면 대기 시간(초) */
+const DONE_SECONDS = 8
+
+const GENERIC_ERROR: ErrorDef = {
+  key: 'kiosk-error',
+  severity: 'system',
+  stage: '측정',
+  icon: ERRORS['network-error'].icon,
+  title: '문제가 발생했어요',
+  message: '측정 중 오류가 발생했어요.\n다시 시도해 주세요.',
+  primary: '다시 시도',
+  secondary: '처음으로',
+}
+
+function Kiosk() {
+  const roster = useQuery({ queryKey: ['roster'], queryFn: fetchRoster })
+
+  const [phase, setPhase] = useState<Phase>('idle')
+  const [doneLeft, setDoneLeft] = useState(DONE_SECONDS)
+  const [summary, setSummary] = useState<MeasureSummary | null>(null)
+  const [user, setUser] = useState<KioskUser | null>(null)
+  const [checkType, setCheckType] = useState<string | null>(null)
+  const [visitId, setVisitId] = useState<string | null>(null)
+  const [measuringStage, setMeasuringStage] = useState<MeasuringStage>('iris')
+  const [countdownSec, setCountdownSec] = useState<number | null>(null)
+  const [waitMessage, setWaitMessage] = useState<string | undefined>(undefined)
+  const [vitalsResult, setVitalsResult] = useState<VitalsResult | null>(null)
+  const [errorDef, setErrorDef] = useState<ErrorDef>(GENERIC_ERROR)
+
+  const startedAtRef = useRef<Date | null>(null)
+  const wsRef = useRef<WebSocket | null>(null)
+
+  const closeSocket = useCallback(() => {
+    wsRef.current?.close()
+    wsRef.current = null
+  }, [])
+
+  const reset = useCallback(() => {
+    closeSocket()
+    setUser(null)
+    setCheckType(null)
+    setVisitId(null)
+    setCountdownSec(null)
+    setWaitMessage(undefined)
+    setVitalsResult(null)
+    setPhase('idle')
+  }, [closeSocket])
+
+  const handleVisitEvent = useCallback((event: VisitEvent) => {
+    switch (event.type) {
+      case 'capture_started':
+        setMeasuringStage('iris')
+        break
+      case 'sensor_wait':
+        setMeasuringStage('vitals_wait')
+        setWaitMessage(event.message)
+        break
+      case 'sensor_measuring':
+        setMeasuringStage('vitals_measuring')
+        setCountdownSec(null)
+        break
+      case 'sensor_countdown':
+        setMeasuringStage('vitals_measuring')
+        setCountdownSec(event.remainingSec)
+        break
+      case 'error':
+        setErrorDef(ERRORS[event.code] ?? GENERIC_ERROR)
+        setPhase('error')
+        break
+      case 'done': {
+        const startedAt = startedAtRef.current ?? new Date()
+        const vitals = event.vitals
+        const hasVitals =
+          vitals.temp_c != null || vitals.heart_rate_bpm != null || vitals.spo2_pct != null
+        setSummary({
+          measuredAt: startedAt,
+          durationSec: Math.max(
+            1,
+            Math.round((Date.now() - startedAt.getTime()) / 1000)
+          ),
+          vitals,
+        })
+        if (hasVitals) {
+          setVitalsResult(vitals)
+          setMeasuringStage('vitals_result')
+        } else {
+          setPhase('analyzing')
+        }
+        break
+      }
+      // capture_error(비-종단)/sensor_timeout: 뒤이어 오는 error/done 이벤트가 화면을 결정하므로 무시
+    }
+  }, [])
+
+  const connectSocket = useCallback(
+    (id: string) => {
+      closeSocket()
+      wsRef.current = openVisitSocket(id, handleVisitEvent)
+    },
+    [closeSocket, handleVisitEvent]
+  )
+
+  const selectUser = useCallback((selected: KioskUser, type: string) => {
+    setUser(selected)
+    setCheckType(type)
+    setPhase('scanned')
+  }, [])
+
+  const submitStress = useCallback(
+    async (level: StressLevel) => {
+      if (!user || !checkType) return
+      try {
+        const { visitId: id } = await startVisit({
+          name: user.name,
+          dept: user.dept,
+          checkType,
+          stressLabel: level.label,
+          stressScore: level.score,
+        })
+        setVisitId(id)
+        startedAtRef.current = new Date()
+        setMeasuringStage('iris')
+        setCountdownSec(null)
+        setVitalsResult(null)
+        connectSocket(id)
+        setPhase('measuring')
+      } catch {
+        setErrorDef(GENERIC_ERROR)
+        setPhase('error')
+      }
+    },
+    [user, checkType, connectSocket]
+  )
+
+  const retryFromError = useCallback(() => {
+    if (!visitId) {
+      reset()
+      return
+    }
+    retryVisit(visitId).catch(() => {})
+    connectSocket(visitId)
+    setMeasuringStage('iris')
+    setCountdownSec(null)
+    setVitalsResult(null)
+    setPhase('measuring')
+  }, [visitId, connectSocket, reset])
+
+  const cancelFromError = useCallback(() => {
+    if (visitId) cancelVisit(visitId).catch(() => {})
+    reset()
+  }, [visitId, reset])
+
+  // scanned 단계: 인증 완료 화면을 잠시 보여준 뒤 스트레스 자가진단으로
+  useEffect(() => {
+    if (phase !== 'scanned') return
+    const timer = setTimeout(() => setPhase('stress'), SCANNED_DELAY)
+    return () => clearTimeout(timer)
+  }, [phase])
+
+  // vitals_result 단계: 실제 값이 0에서 올라가는 걸 잠시 보여준 뒤 analyzing으로
+  useEffect(() => {
+    if (phase !== 'measuring' || measuringStage !== 'vitals_result') return
+    const timer = setTimeout(() => setPhase('analyzing'), 1600)
+    return () => clearTimeout(timer)
+  }, [phase, measuringStage])
+
+  // analyzing 단계: 측정 완료 → 짧은 연출 후 완료 화면
+  useEffect(() => {
+    if (phase !== 'analyzing') return
+    const timer = setTimeout(() => setPhase('done'), ANALYZE_DELAY)
+    return () => clearTimeout(timer)
+  }, [phase])
+
+  // done 단계: 카운트다운 후 자동으로 대기 화면 복귀
+  useEffect(() => {
+    if (phase !== 'done') return
+    setDoneLeft(DONE_SECONDS)
+    const interval = setInterval(() => {
+      setDoneLeft((s) => (s > 0 ? s - 1 : 0))
+    }, 1000)
+    const timer = setTimeout(reset, DONE_SECONDS * 1000)
+    return () => {
+      clearInterval(interval)
+      clearTimeout(timer)
+    }
+  }, [phase, reset])
+
+  useEffect(() => closeSocket, [closeSocket])
+
+  if (roster.isLoading) {
+    return (
+      <KioskFrame>
+        <div className="flex h-full items-center justify-center text-3xl text-muted-foreground">
+          키오스크 서버에 연결하는 중입니다…
+        </div>
+      </KioskFrame>
+    )
+  }
+
+  if (roster.isError || !roster.data) {
+    return (
+      <KioskFrame>
+        <ErrorScreen def={ERRORS['out-of-service']} onPrimary={() => roster.refetch()} />
+      </KioskFrame>
+    )
+  }
+
+  return (
+    <KioskFrame>
+      {phase === 'idle' && <IdleScreen onStart={() => setPhase('select')} />}
+      {phase === 'select' && (
+        <UserSelectScreen
+          roster={roster.data.roster}
+          checkTypes={roster.data.checkTypes}
+          onSelect={selectUser}
+        />
+      )}
+      {phase === 'scanned' && user && checkType && (
+        <ScannedScreen user={user} checkType={checkType} />
+      )}
+      {phase === 'stress' && (
+        <StressScreen levels={roster.data.stressLevels} onSubmit={submitStress} />
+      )}
+      {phase === 'measuring' && (
+        <MeasuringScreen
+          stage={measuringStage}
+          countdownSec={countdownSec}
+          waitMessage={waitMessage}
+          vitalsResult={vitalsResult}
+          username={user?.name ?? ''}
+        />
+      )}
+      {phase === 'analyzing' && <AnalyzingScreen />}
+      {phase === 'done' && summary && (
+        <DoneScreen summary={summary} secondsLeft={doneLeft} onHome={reset} />
+      )}
+      {phase === 'error' && (
+        <ErrorScreen def={errorDef} onPrimary={retryFromError} onSecondary={cancelFromError} />
+      )}
+    </KioskFrame>
+  )
+}
+
+/**
+ * 스크린샷/데모 모드 — URL `?error=<key>` 로 특정 오류 화면을 단독 렌더.
+ * 예: /?error=qr-expired
+ */
+function ErrorPreview({ errorKey }: { errorKey: string }) {
+  const def = ERRORS[errorKey]
+  if (!def) {
+    return (
+      <KioskFrame>
+        <div className="flex h-full items-center justify-center text-3xl text-muted-foreground">
+          알 수 없는 오류 키: {errorKey}
+        </div>
+      </KioskFrame>
+    )
+  }
+  return (
+    <KioskFrame>
+      <ErrorScreen def={def} />
+    </KioskFrame>
+  )
+}
+
+export default function App() {
+  const errorKey =
+    typeof window !== 'undefined'
+      ? new URLSearchParams(window.location.search).get('error')
+      : null
+
+  return (
+    <QueryClientProvider client={queryClient}>
+      {errorKey ? <ErrorPreview errorKey={errorKey} /> : <Kiosk />}
+    </QueryClientProvider>
+  )
+}
