@@ -2,9 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { QueryClient, QueryClientProvider, useQuery } from '@tanstack/react-query'
 import { KioskFrame } from '@/components/KioskFrame'
 import { IdleScreen } from '@/screens/IdleScreen'
-import { UserSelectScreen } from '@/screens/UserSelectScreen'
-import { ScannedScreen } from '@/screens/ScannedScreen'
-import type { KioskUser } from '@/screens/ScannedScreen'
+import { ConsentScreen } from '@/screens/ConsentScreen'
+import { NameInputScreen } from '@/screens/NameInputScreen'
+import type { KioskUser } from '@/screens/NameInputScreen'
 import { StressScreen } from '@/screens/StressScreen'
 import { MeasuringScreen } from '@/screens/MeasuringScreen'
 import type { MeasuringStage, VitalsResult } from '@/screens/MeasuringScreen'
@@ -33,20 +33,21 @@ const queryClient = new QueryClient({
 
 type Phase =
   | 'idle'
-  | 'select'
-  | 'scanned'
+  | 'consent'
+  | 'nameInput'
   | 'stress'
   | 'measuring'
   | 'analyzing'
   | 'done'
   | 'error'
 
-/** 본인 확인 완료 화면 표시 시간(ms) */
-const SCANNED_DELAY = 1800
 /** AI 분석 연출 시간(ms) */
 const ANALYZE_DELAY = 2800
 /** 완료 화면 대기 시간(초) */
 const DONE_SECONDS = 8
+/** 박람회 시연 방문객은 사내 부서/출퇴근 구분이 없으므로 고정값을 보낸다 */
+const EXPO_DEPT = '박람회 방문객'
+const EXPO_CHECK_TYPE = '체험'
 
 const GENERIC_ERROR: ErrorDef = {
   key: 'kiosk-error',
@@ -66,7 +67,6 @@ function Kiosk() {
   const [doneLeft, setDoneLeft] = useState(DONE_SECONDS)
   const [summary, setSummary] = useState<MeasureSummary | null>(null)
   const [user, setUser] = useState<KioskUser | null>(null)
-  const [checkType, setCheckType] = useState<string | null>(null)
   const [visitId, setVisitId] = useState<string | null>(null)
   const [measuringStage, setMeasuringStage] = useState<MeasuringStage>('iris')
   const [countdownSec, setCountdownSec] = useState<number | null>(null)
@@ -85,7 +85,6 @@ function Kiosk() {
   const reset = useCallback(() => {
     closeSocket()
     setUser(null)
-    setCheckType(null)
     setVisitId(null)
     setCountdownSec(null)
     setWaitMessage(undefined)
@@ -147,20 +146,19 @@ function Kiosk() {
     [closeSocket, handleVisitEvent]
   )
 
-  const selectUser = useCallback((selected: KioskUser, type: string) => {
-    setUser(selected)
-    setCheckType(type)
-    setPhase('scanned')
+  const submitName = useCallback((entered: KioskUser) => {
+    setUser(entered)
+    setPhase('stress')
   }, [])
 
   const submitStress = useCallback(
     async (level: StressLevel) => {
-      if (!user || !checkType) return
+      if (!user) return
       try {
         const { visitId: id } = await startVisit({
           name: user.name,
-          dept: user.dept,
-          checkType,
+          dept: EXPO_DEPT,
+          checkType: EXPO_CHECK_TYPE,
           stressLabel: level.label,
           stressScore: level.score,
         })
@@ -176,7 +174,7 @@ function Kiosk() {
         setPhase('error')
       }
     },
-    [user, checkType, connectSocket]
+    [user, connectSocket]
   )
 
   const retryFromError = useCallback(() => {
@@ -196,13 +194,6 @@ function Kiosk() {
     if (visitId) cancelVisit(visitId).catch(() => {})
     reset()
   }, [visitId, reset])
-
-  // scanned 단계: 인증 완료 화면을 잠시 보여준 뒤 스트레스 자가진단으로
-  useEffect(() => {
-    if (phase !== 'scanned') return
-    const timer = setTimeout(() => setPhase('stress'), SCANNED_DELAY)
-    return () => clearTimeout(timer)
-  }, [phase])
 
   // vitals_result 단계: 실제 값이 0에서 올라가는 걸 잠시 보여준 뒤 analyzing으로
   useEffect(() => {
@@ -254,17 +245,11 @@ function Kiosk() {
 
   return (
     <KioskFrame>
-      {phase === 'idle' && <IdleScreen onStart={() => setPhase('select')} />}
-      {phase === 'select' && (
-        <UserSelectScreen
-          roster={roster.data.roster}
-          checkTypes={roster.data.checkTypes}
-          onSelect={selectUser}
-        />
+      {phase === 'idle' && <IdleScreen onStart={() => setPhase('consent')} />}
+      {phase === 'consent' && (
+        <ConsentScreen onAgree={() => setPhase('nameInput')} onDecline={reset} />
       )}
-      {phase === 'scanned' && user && checkType && (
-        <ScannedScreen user={user} checkType={checkType} />
-      )}
+      {phase === 'nameInput' && <NameInputScreen onSubmit={submitName} />}
       {phase === 'stress' && (
         <StressScreen levels={roster.data.stressLevels} onSubmit={submitStress} />
       )}
